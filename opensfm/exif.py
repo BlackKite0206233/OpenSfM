@@ -239,8 +239,25 @@ class EXIF:
             reflon = 'E'
         return reflon, reflat
 
+    def extract_dji_lon_lat(self):
+        lon = self.xmp[0]['@drone-dji:Longitude']
+        lat = self.xmp[0]['@drone-dji:Latitude']
+        lon_number = float(lon[1:])
+        lat_number = float(lat[1:])
+        lon_number = lon_number if lon[0] == '+' else -lon_number
+        lat_number = lat_number if lat[0] == '+' else -lat_number
+        return lon_number, lat_number
+
+    def extract_dji_altitude(self):
+        return float(self.xmp[0]['@drone-dji:AbsoluteAltitude'])
+
+    def has_dji_xmp(self):
+        return (len(self.xmp) > 0) and ('@drone-dji:Latitude' in self.xmp[0])
+
     def extract_lon_lat(self):
-        if 'GPS GPSLatitude' in self.tags:
+        if self.has_dji_xmp():
+            lon, lat = self.extract_dji_lon_lat()
+        elif 'GPS GPSLatitude' in self.tags:
             reflon, reflat = self.extract_ref_lon_lat()
             lat = gps_to_decimal(self.tags['GPS GPSLatitude'].values, reflat)
             lon = gps_to_decimal(self.tags['GPS GPSLongitude'].values, reflon)
@@ -249,7 +266,9 @@ class EXIF:
         return lon, lat
 
     def extract_altitude(self):
-        if 'GPS GPSAltitude' in self.tags:
+        if self.has_dji_xmp():
+            altitude = self.extract_dji_altitude()
+        elif 'GPS GPSAltitude' in self.tags:
             altitude = eval_frac(self.tags['GPS GPSAltitude'].values[0])
         else:
             altitude = None
@@ -364,7 +383,7 @@ def hard_coded_calibration(exif):
 
 
 def focal_ratio_calibration(exif):
-    if exif['focal_ratio']:
+    if exif.get('focal_ratio'):
         return {
             'focal': exif['focal_ratio'],
             'k1': 0.0,
@@ -376,12 +395,13 @@ def focal_ratio_calibration(exif):
 
 
 def focal_xy_calibration(exif):
-    if exif['focal_x']:
+    focal = exif.get('focal_x', exif.get('focal_ratio'))
+    if focal:
         return {
-            'focal_x': exif['focal_x'],
-            'focal_y': exif['focal_y'],
-            'c_x': exif['c_x'],
-            'c_y': exif['c_y'],
+            'focal_x': focal,
+            'focal_y': focal,
+            'c_x': exif.get('c_x', 0.0),
+            'c_y': exif.get('c_y', 0.0),
             'k1': 0.0,
             'k2': 0.0,
             'p1': 0.0,
@@ -449,6 +469,22 @@ def camera_from_exif_metadata(metadata, data):
         camera.p1_prior = calib['p1']
         camera.p2_prior = calib['p2']
         camera.k3_prior = calib['k3']
+        return camera
+    elif pt == 'fisheye':
+        calib = (hard_coded_calibration(metadata)
+                 or focal_ratio_calibration(metadata)
+                 or default_calibration(data))
+        camera = types.FisheyeCamera()
+        camera.id = metadata['camera']
+        camera.width = metadata['width']
+        camera.height = metadata['height']
+        camera.projection_type = pt
+        camera.focal = calib['focal']
+        camera.k1 = calib['k1']
+        camera.k2 = calib['k2']
+        camera.focal_prior = calib['focal']
+        camera.k1_prior = calib['k1']
+        camera.k2_prior = calib['k2']
         return camera
     elif pt in ['equirectangular', 'spherical']:
         camera = types.SphericalCamera()

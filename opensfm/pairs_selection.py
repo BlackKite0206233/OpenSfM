@@ -2,12 +2,14 @@ import logging
 from itertools import combinations
 from collections import defaultdict
 import numpy as np
+import os.path
 
 import scipy.spatial as spatial
 
 from opensfm import bow
+from opensfm import vlad
 from opensfm import context
-
+from opensfm import feature_loader
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,9 @@ def match_candidates_by_distance(images_ref, images_cand, exifs, reference,
     at different altitudes to be matched together.  Otherwise, for drone
     datasets, flights at different altitudes do not get matched.
     """
+    if len(images_cand) == 0:
+        return set()
+
     if max_neighbors <= 0 and max_distance <= 0:
         return set()
     max_neighbors = max_neighbors or 99999999
@@ -51,6 +56,9 @@ def match_candidates_by_distance(images_ref, images_cand, exifs, reference,
         distances, neighbors = tree.query(
             point, k=nn, distance_upper_bound=max_distance)
 
+        if type(neighbors) == int:      # special case with only one NN
+            neighbors = [neighbors]
+
         for j in neighbors:
             if j >= len(images_cand):
                 continue
@@ -71,11 +79,70 @@ def match_candidates_with_bow(data, images_ref, images_cand,
     GPS distance.
 
     If enforce_other_cameras is True, we keep max_neighbors images
-    with same cameras AND  max_neighbors images from any other different
+    with same cameras AND max_neighbors images from any other different
     camera.
     """
     if max_neighbors <= 0:
         return set()
+
+    preempted_candidates, need_load = preempt_candidates(
+            images_ref, images_cand,
+            exifs, reference,
+            max_gps_neighbors, max_gps_distance)
+
+    # construct BoW histograms
+    logger.info("Computing %d BoW histograms" % len(need_load))
+    histograms = load_histograms(data, need_load)
+
+    # parallel VLAD neighbors computation
+    args, processes, batch_size = create_parallel_matching_args(
+        data, preempted_candidates, histograms)
+    logger.info("Computing BoW candidates with %d processes" % processes)
+    results = context.parallel_map(match_bow_unwrap_args, args, processes, batch_size)
+
+    return construct_pairs(results, max_neighbors, exifs, enforce_other_cameras)
+
+
+def match_candidates_with_vlad(data, images_ref, images_cand,
+                               exifs, reference, max_neighbors,
+                               max_gps_distance, max_gps_neighbors,
+                               enforce_other_cameras):
+    """Find candidate matching pairs using VLAD-based distance.
+     If max_gps_distance > 0, then we use first restrain a set of
+    candidates using max_gps_neighbors neighbors selected using
+    GPS distance.
+
+    If enforce_other_cameras is True, we keep max_neighbors images
+    with same cameras AND max_neighbors images from any other different
+    camera.
+    """
+    if max_neighbors <= 0:
+        return set()
+
+    preempted_candidates, need_load = preempt_candidates(
+            images_ref, images_cand,
+            exifs, reference,
+            max_gps_neighbors, max_gps_distance)
+
+    # construct VLAD histograms
+    logger.info("Computing %d VLAD histograms" % len(need_load))
+    histograms = vlad_histograms(need_load, data)
+
+    # parallel VLAD neighbors computation
+    args, processes, batch_size = create_parallel_matching_args(
+        data, preempted_candidates, histograms)
+    logger.info("Computing VLAD candidates with %d processes" % processes)
+    results = context.parallel_map(match_vlad_unwrap_args, args, processes, batch_size)
+
+    return construct_pairs(results, max_neighbors, exifs, enforce_other_cameras)
+
+
+def preempt_candidates(images_ref, images_cand,
+                       exifs, reference,
+                       max_gps_neighbors, max_gps_distance):
+    """Preempt candidates using GPS to reduce set of images
+    from which to load data to save RAM.
+    """
 
     # preempt candidates images using GPS
     preempted_cand = {im: images_cand for im in images_ref}
@@ -86,38 +153,44 @@ def match_candidates_with_bow(data, images_ref, images_cand,
                                                  max_gps_distance)
         preempted_cand = defaultdict(list)
         for p in gps_pairs:
-            preempted_cand[p[0]].append(p[1])
-            preempted_cand[p[1]].append(p[0])
+            if p[0] in images_ref:
+                preempted_cand[p[0]].append(p[1])
+            if p[1] in images_ref:
+                preempted_cand[p[1]].append(p[0])
 
-    # reduce sets of images from which to load words (RAM saver)
+    # reduce sets of images from which to load histograms (RAM saver)
     need_load = set(preempted_cand.keys())
-    for v in preempted_cand.values():
+    for k, v in preempted_cand.items():
         need_load.update(v)
+        need_load.add(k)
+    return preempted_cand, need_load
 
-    # construct BoW histograms
-    logger.info("Computing %d BoW histograms" % len(need_load))
-    histograms = load_histograms(data, need_load)
-    args = list(match_bow_arguments(preempted_cand, histograms))
 
-    # parralel BoW neighbors computation
-    per_process = 512
-    processes = context.processes_that_fit_in_memory(data.config['processes'], per_process)
-    batch_size = max(1, len(args)/(2*processes))
-    logger.info("Computing BoW candidates with %d processes" % processes)
-    results = context.parallel_map(match_bow_unwrap_args, args, processes, batch_size)
-
-    # construct final sets of pairs to match
-    pairs = set()
-    for im, order, other in results:
+def construct_pairs(results, max_neighbors, exifs, enforce_other_cameras):
+    """Construct final sets of pairs to match"""
+    pairs = dict()
+    for im, distances, other in results:
+        order = np.argsort(distances)
         if enforce_other_cameras:
-            pairs = pairs.union(pairs_from_neighbors(im, exifs, order, other, max_neighbors))
+            pairs.update(pairs_from_neighbors(im, exifs, distances, order, other, max_neighbors))
         else:
             for i in order[:max_neighbors]:
-                pairs.add(tuple(sorted((im, other[i]))))
+                pairs[tuple(sorted((im, other[i])))] = distances[i]
     return pairs
 
 
-def match_bow_arguments(candidates, histograms):
+def create_parallel_matching_args(data, preempted_cand, histograms):
+    """Create arguments to matching function"""
+    args = list(match_histogram_arguments(preempted_cand, histograms))
+
+     # parallel VLAD neighbors computation
+    per_process = 512
+    processes = context.processes_that_fit_in_memory(data.config['processes'], per_process)
+    batch_size = max(1, len(args)/(2*processes))
+    return args, processes, batch_size
+
+
+def match_histogram_arguments(candidates, histograms):
     """ Generate arguments for parralel processing of BoW """
     for im, cands in candidates.items():
         yield (im, cands, histograms)
@@ -127,6 +200,12 @@ def match_bow_unwrap_args(args):
     """ Wrapper for parralel processing of BoW """
     image, other_images, histograms = args
     return bow_distances(image, other_images, histograms)
+
+
+def match_vlad_unwrap_args(args):
+    """ Wrapper for parralel processing of VLAD """
+    image, other_images, histograms = args
+    return vlad.vlad_distances(image, other_images, histograms)
 
 
 def match_candidates_by_time(images_ref, images_cand, exifs, max_neighbors):
@@ -147,6 +226,10 @@ def match_candidates_by_time(images_ref, images_cand, exifs, max_neighbors):
 
         time = exifs[image_ref]['capture_time']
         distances, neighbors = tree.query([time], k=nn)
+
+        if type(neighbors) == int:      # special case with only one NN
+            neighbors = [neighbors]
+
         for j in neighbors:
             if j >= len(images_cand):
                 continue
@@ -187,6 +270,10 @@ def match_candidates_from_metadata(images_ref, images_cand, exifs, data):
     bow_gps_distance = data.config['matching_bow_gps_distance']
     bow_gps_neighbors = data.config['matching_bow_gps_neighbors']
     bow_other_cameras = data.config['matching_bow_other_cameras']
+    vlad_neighbors = data.config['matching_vlad_neighbors']
+    vlad_gps_distance = data.config['matching_vlad_gps_distance']
+    vlad_gps_neighbors = data.config['matching_vlad_gps_neighbors']
+    vlad_other_cameras = data.config['matching_vlad_other_cameras']
 
     if not data.reference_lla_exists():
         data.invent_reference_lla()
@@ -201,12 +288,13 @@ def match_candidates_from_metadata(images_ref, images_cand, exifs, data):
 
     images_ref.sort()
 
-    if max_distance == gps_neighbors == time_neighbors == order_neighbors == bow_neighbors == 0:
+    if max_distance == gps_neighbors == time_neighbors == order_neighbors == bow_neighbors == vlad_neighbors == 0:
         # All pair selection strategies deactivated so we match all pairs
         d = set()
         t = set()
         o = set()
         b = set()
+        v = set()
         pairs = set([tuple(sorted([i, j])) for i in images_ref for j in images_cand])
     else:
         d = match_candidates_by_distance(images_ref, images_cand, exifs, reference,
@@ -217,7 +305,11 @@ def match_candidates_from_metadata(images_ref, images_cand, exifs, data):
                                       exifs, reference, bow_neighbors,
                                       bow_gps_distance, bow_gps_neighbors,
                                       bow_other_cameras)
-        pairs = d | t | o | b
+        v = match_candidates_with_vlad(data, images_ref, images_cand,
+                                       exifs, reference, vlad_neighbors,
+                                       vlad_gps_distance, vlad_gps_neighbors,
+                                       vlad_other_cameras)
+        pairs = d | t | o | set(b) | set(v)
 
     pairs = ordered_pairs(pairs, images_ref)
 
@@ -225,7 +317,8 @@ def match_candidates_from_metadata(images_ref, images_cand, exifs, data):
         "num_pairs_distance": len(d),
         "num_pairs_time": len(t),
         "num_pairs_order": len(o),
-        "num_pairs_bow": len(b)
+        "num_pairs_bow": len(b),
+        "num_pairs_vlad": len(v),
     }
     return pairs, report
 
@@ -245,7 +338,7 @@ def bow_distances(image, other_images, histograms):
             h2 = histograms[im2]
             distances.append(np.fabs(h - h2).sum())
             other.append(im2)
-    return image, np.argsort(distances), other
+    return image, distances, other
 
 
 def load_histograms(data, images):
@@ -255,23 +348,38 @@ def load_histograms(data, images):
     histograms = {}
     bows = bow.load_bows(data.config)
     for im in images:
-        words = data.load_words(im)
-        if words is None:
-            logger.error("Could not load words for image {}".format(im))
+        filtered_words = feature_loader.instance.load_words(data, im, masked=True)
+        if filtered_words is None:
+            logger.error("No words in image {}".format(im))
             continue
-
-        mask = data.load_masks(data, im) if hasattr(data, 'load_masks') else None
-        filtered_words = words[mask] if mask else words
         if len(filtered_words) <= min_num_feature:
             logger.warning("Too few filtered features in image {}: {}".format(
                 im, len(filtered_words)))
             continue
 
-        histograms[im] = bows.histogram(words[:, 0])
+        histograms[im] = bows.histogram(filtered_words[:, 0])
     return histograms
 
 
-def pairs_from_neighbors(image, exifs, order, other, max_neighbors):
+def vlad_histograms(images, data):
+    """ Construct VLAD histograms from the image features.
+
+        Returns a dictionary of VLAD vectors for the images.
+    """
+    if len(images) == 0:
+        return {}
+
+    words = vlad.instance.load_words(data)
+    vlads = {}
+    for im in images:
+        _, features, _ = feature_loader.instance.load_points_features_colors(
+            data, im, masked=True)
+        vlads[im] = vlad.instance.vlad_histogram(im, features, words)
+
+    return vlads
+
+
+def pairs_from_neighbors(image, exifs, distances, order, other, max_neighbors):
     """Construct matching pairs given closest ordered neighbors.
 
     Pairs will of form (image, im2), im2 being the closest max_neighbors
@@ -281,18 +389,19 @@ def pairs_from_neighbors(image, exifs, order, other, max_neighbors):
     same_camera, other_cameras = [], []
     for i in order:
         im2 = other[i]
+        d = distances[i]
         if exifs[im2]['camera'] == exifs[image]['camera']:
             if len(same_camera) < max_neighbors:
-                same_camera.append(im2)
+                same_camera.append((im2, d))
         else:
             if len(other_cameras) < max_neighbors:
-                other_cameras.append(im2)
+                other_cameras.append((im2, d))
         if len(same_camera) + len(other_cameras) >= 2 * max_neighbors:
             break
 
-    pairs = set()
-    for im2 in same_camera+other_cameras:
-        pairs.add(tuple(sorted((image, im2))))
+    pairs = dict()
+    for im2, d in same_camera+other_cameras:
+        pairs[tuple(sorted((image, im2)))] = d
     return pairs
 
 
