@@ -56,7 +56,7 @@ def detect(args):
 
     log.setup()
 
-    need_words = data.config['matcher_type'] == 'WORDS' or data.config['matching_bow_neighbors'] > 0
+    need_words = data.config['matcher_type'] == 'WORDS' or data.config['matcher_type'] == 'WORDS_SYMMETRIC' or data.config['matching_bow_neighbors'] > 0
     need_flann = data.config['matcher_type'] == 'FLANN'
     has_words = not need_words or data.words_exist(image)
     has_flann = not need_flann or data.feature_index_exists(image)

@@ -130,7 +130,8 @@ class EXIF:
     def __init__(self, fileobj):
         self.tags = exifread.process_file(fileobj, details=False)
         fileobj.seek(0)
-        self.xmp = get_xmp(fileobj)
+        self.xmp = {}
+        # self.xmp = get_xmp(fileobj)
 
     def extract_image_size(self):
         # Image Width and Image Height
@@ -294,7 +295,7 @@ class EXIF:
 
     def extract_exif(self):
         width, height = self.extract_image_size()
-        projection_type = self.extract_projection_type()
+        projection_type = 'perspective'
         focal_35, focal_ratio = self.extract_focal()
         make, model = self.extract_make(), self.extract_model()
         orientation = self.extract_orientation()

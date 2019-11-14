@@ -31,8 +31,7 @@ if __name__ == "__main__":
     else:
         base_output_path = os.path.join(data.data_path, 'pmvs')
 
-    print "Converting dataset [%s] to PMVS dir [%s]" % (
-        data.data_path, base_output_path)
+    print("Converting dataset [%s] to PMVS dir [%s]" % (data.data_path, base_output_path))
 
     io.mkdir_p(base_output_path)
 
@@ -54,11 +53,13 @@ if __name__ == "__main__":
         reconstructions = data.load_reconstruction()
 
     for h, reconstruction in enumerate(reconstructions):
-        print "Reconstruction", h
+        print("Reconstruction", h)
         output_path = os.path.join(base_output_path, "recon%d" % h)
         io.mkdir_p(output_path)
         io.mkdir_p(os.path.join(output_path, "visualize"))
         io.mkdir_p(os.path.join(output_path, "txt"))
+        io.mkdir_p(os.path.join(output_path, "pose"))
+        io.mkdir_p(os.path.join(output_path, "poseInverse"))
         io.mkdir_p(os.path.join(output_path, "models"))
 
         shot_index = {image: i for i, image in enumerate(reconstruction.shots)}
@@ -70,7 +71,7 @@ if __name__ == "__main__":
         for image, i in shot_index.items():
             shot = reconstruction.shots[image]
             base = "%08d" % i
-            print "Image:", image, base
+            print( "Image:", image, base)
 
             # vis.dat for this image
             if use_vis_data:
@@ -106,7 +107,17 @@ if __name__ == "__main__":
             # write camera projection matrix to txt/%08d.txt
             resized_h, resized_w = resized_image.shape[:2]
             resized_K = camera.get_K_in_pixel_coordinates(resized_w, resized_h)
-            P = resized_K.dot(shot.pose.get_Rt())
+            pose = shot.pose.get_Rt()
+            poseInverse = shot.pose.inverse().get_Rt()
+            P = resized_K.dot(pose)
+
+            new_pose = os.path.join(output_path, "pose", base + ".txt")
+            with open(new_pose, "w") as f:
+                np.savetxt(f, pose, '%f')
+
+            new_poseInverse = os.path.join(output_path, "poseInverse", base + ".txt")
+            with open(new_poseInverse, "w") as f:
+                np.savetxt(f, poseInverse, '%f')
 
             new_txt = os.path.join(output_path, "txt", base + ".txt")
             with open(new_txt, "w") as f:

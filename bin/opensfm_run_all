@@ -7,11 +7,11 @@ PYTHON=${2:-python}
 
 echo "Running using Python command: $PYTHON"
 
-$PYTHON $DIR/opensfm extract_metadata $1
-$PYTHON $DIR/opensfm detect_features $1
-$PYTHON $DIR/opensfm match_features $1
-$PYTHON $DIR/opensfm create_tracks $1
-$PYTHON $DIR/opensfm reconstruct $1
-$PYTHON $DIR/opensfm mesh $1
-$PYTHON $DIR/opensfm undistort $1
-$PYTHON $DIR/opensfm compute_depthmaps $1
+python3 $DIR/opensfm extract_metadata $1
+python3 $DIR/opensfm detect_features $1
+python3 $DIR/opensfm match_features $1
+python3 $DIR/opensfm create_tracks $1
+python3 $DIR/opensfm reconstruct $1
+python3 $DIR/opensfm mesh $1
+# python3 $DIR/opensfm undistort $1
+# python3 $DIR/opensfm compute_depthmaps $1
